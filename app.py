@@ -8,7 +8,11 @@ from scipy.io import wavfile
 import librosa
 
 # Import local modules
-from src.database.melodies import MELODIES, get_melody_by_id
+from src.database.drills import (
+    DRILL_LEVELS,
+    get_drills_by_level,
+    duration_to_seconds,
+)
 from src.audio_processing.librosa_pyin import LibrosaPyinTracker
 from src.evaluation.melody_aligner import MelodyAligner
 
@@ -104,8 +108,12 @@ st.markdown("""
 # Musical Helpers
 # -----------------
 NOTE_FREQS = {
-    'C4': 261.63, 'C#4': 277.18, 'D4': 293.66, 'D#4': 311.13, 'E4': 329.63, 'F4': 349.23, 'F#4': 369.99, 'G4': 392.00, 'G#4': 415.30, 'A4': 440.00, 'A#4': 466.16, 'B4': 493.88,
-    'C5': 523.25, 'C#5': 554.37, 'D5': 587.33, 'D#5': 622.25, 'E5': 659.25, 'F5': 698.46, 'F#5': 739.99, 'G5': 783.99, 'G#5': 830.61, 'A5': 880.00, 'A#5': 932.33, 'B5': 987.77
+    'C4': 261.63, 'C#4': 277.18, 'Db4': 277.18, 'D4': 293.66, 'D#4': 311.13, 'Eb4': 311.13,
+    'E4': 329.63, 'F4': 349.23, 'F#4': 369.99, 'Gb4': 369.99, 'G4': 392.00, 'G#4': 415.30,
+    'Ab4': 415.30, 'A4': 440.00, 'A#4': 466.16, 'Bb4': 466.16, 'B4': 493.88,
+    'C5': 523.25, 'C#5': 554.37, 'Db5': 554.37, 'D5': 587.33, 'D#5': 622.25, 'Eb5': 622.25,
+    'E5': 659.25, 'F5': 698.46, 'F#5': 739.99, 'Gb5': 739.99, 'G5': 783.99, 'G#5': 830.61,
+    'Ab5': 830.61, 'A5': 880.00, 'A#5': 932.33, 'Bb5': 932.33, 'B5': 987.77,
 }
 
 FINGERING_DATABASE = {
@@ -122,29 +130,34 @@ FINGERING_DATABASE = {
 def get_fingering(note: str) -> dict:
     return FINGERING_DATABASE.get(note, {'guitar': 'Check chord diagram', 'piano': 'Varies'})
 
-def generate_reference_audio(melody: dict, sample_rate=22050) -> bytes:
-    """Synthesize reference melody into a clean sine wave audio track."""
+def generate_reference_audio(drill: dict, sample_rate=22050) -> bytes:
+    """Synthesize reference drill into a clean sine wave audio track."""
+    tempo_bpm = drill.get("tempo_bpm", 60)
     audio_data = []
-    
-    for note, dur in zip(melody["notes"], melody["durations"]):
+
+    for note, dur in zip(drill["notes"], drill["durations"]):
         freq = NOTE_FREQS.get(note, 261.63)
-        # Generate time vector for note duration
-        t = np.linspace(0, dur * 0.5, int(sample_rate * dur * 0.5), endpoint=False)
-        # Generate sine wave with simple fade out to avoid clicks
+        note_seconds = duration_to_seconds(dur, tempo_bpm)
+        t = np.linspace(0, note_seconds, int(sample_rate * note_seconds), endpoint=False)
         fade = np.linspace(1.0, 0.01, len(t))
         wave = np.sin(2 * np.pi * freq * t) * fade
         audio_data.extend(wave)
-        
-        # Add a brief pause between notes
+
         silence = np.zeros(int(sample_rate * 0.05))
         audio_data.extend(silence)
-        
+
     audio_array = np.array(audio_data, dtype=np.float32)
-    
-    # Save to a virtual WAV file in memory
     buffer = io.BytesIO()
     sf.write(buffer, audio_array, sample_rate, format='wav')
     return buffer.getvalue()
+
+
+DRILL_TYPE_LABELS = {
+    "single_note": "Single Note",
+    "interval": "Interval",
+    "motif": "Short Motif",
+    "melody": "Melody",
+}
 
 # -----------------
 # Sidebar Controls
@@ -156,35 +169,61 @@ alignment_strictness = st.sidebar.slider("Alignment Match Bonus", 1, 5, 2)
 st.sidebar.markdown("""
 ---
 ### 💡 How to Play
-1. **Choose a Melody** from the main dashboard.
+1. **Choose a level** and drill from the Ear Training curriculum.
 2. **Listen** to the reference track.
 3. **Record or Upload** your attempt.
-4. **Analyze** and get real-time feedback on your pitch accuracy, rhythm, and fingering.
+4. **Review** pitch, interval, and rhythm feedback tailored to the drill type.
 """)
 
 # -----------------
 # Main Interface
 # -----------------
 st.markdown("<h1 class='main-title'>🎵 Play-by-Ear Tutor</h1>", unsafe_allow_html=True)
-st.markdown("<div class='subtitle'>Master musical instruments by listening, playing, and learning from instant AI feedback.</div>", unsafe_allow_html=True)
+st.markdown("<div class='subtitle'>Ear Training Fundamentals — hear a note or phrase, reproduce it, and get instant feedback.</div>", unsafe_allow_html=True)
 
-# 1. Selection Card
+# 1. Drill Selection Card
 st.markdown("<div class='dashboard-card'>", unsafe_allow_html=True)
-st.subheader("Step 1: Choose Your Melody")
-selected_melody_name = st.selectbox(
-    "Select an exercise:",
-    options=[m["name"] for m in MELODIES]
+st.subheader("Step 1: Choose Your Drill")
+
+filter_col1, filter_col2 = st.columns(2)
+with filter_col1:
+    selected_level = st.selectbox(
+        "Training level:",
+        options=sorted(DRILL_LEVELS.keys()),
+        format_func=lambda lvl: f"Level {lvl} — {DRILL_LEVELS[lvl]}",
+    )
+with filter_col2:
+    level_drills = get_drills_by_level(selected_level)
+    available_types = sorted({d["type"] for d in level_drills})
+    selected_type = st.selectbox(
+        "Drill type:",
+        options=["all"] + available_types,
+        format_func=lambda t: "All types" if t == "all" else DRILL_TYPE_LABELS.get(t, t),
+    )
+
+filtered_drills = [
+    d for d in level_drills
+    if selected_type == "all" or d["type"] == selected_type
+]
+
+selected_drill_name = st.selectbox(
+    "Select a drill:",
+    options=[d["name"] for d in filtered_drills],
 )
-selected_melody = next(m for m in MELODIES if m["name"] == selected_melody_name)
+selected_drill = next(d for d in filtered_drills if d["name"] == selected_drill_name)
 
 col1, col2 = st.columns([2, 1])
 with col1:
-    st.write(f"**Difficulty:** {selected_melody['difficulty']}")
-    st.write(f"**Description:** {selected_melody['description']}")
-    st.write(f"**Melody Notes:** `{' ➔ '.join(selected_melody['notes'])}`")
+    drill_type_label = DRILL_TYPE_LABELS.get(selected_drill["type"], selected_drill["type"])
+    st.write(f"**Level:** {selected_drill['level']} — {DRILL_LEVELS[selected_drill['level']]}")
+    st.write(f"**Type:** {drill_type_label}")
+    st.write(f"**Difficulty:** {selected_drill['difficulty']}")
+    st.write(f"**Description:** {selected_drill['description']}")
+    if selected_drill.get("interval_name"):
+        st.write(f"**Interval:** {selected_drill['interval_name']}")
+    st.write(f"**Target Notes:** `{' ➔ '.join(selected_drill['notes'])}`")
 with col2:
-    # Reference Audio synthesis & play
-    ref_audio_bytes = generate_reference_audio(selected_melody)
+    ref_audio_bytes = generate_reference_audio(selected_drill)
     st.write("🔈 Reference Guide:")
     st.audio(ref_audio_bytes, format="audio/wav")
 st.markdown("</div>", unsafe_allow_html=True)
@@ -192,12 +231,19 @@ st.markdown("</div>", unsafe_allow_html=True)
 # 2. Recording/Upload Card
 st.markdown("<div class='dashboard-card'>", unsafe_allow_html=True)
 st.subheader("Step 2: Record / Upload Your Performance")
-st.info("Play or sing the target melody clearly using your instrument. Ensure your background noise is minimal.")
+st.info("Listen to the reference, then play or sing the target on your instrument. Keep background noise minimal.")
+
+record_label = {
+    "single_note": "Record your note via microphone",
+    "interval": "Record both notes via microphone",
+    "motif": "Record the motif via microphone",
+    "melody": "Record your performance via microphone",
+}.get(selected_drill["type"], "Record your performance via microphone")
 
 # Support Streamlit standard audio input (mic recorder)
 recorded_file = None
 if hasattr(st, "audio_input"):
-    recorded_file = st.audio_input("Record your performance via microphone")
+    recorded_file = st.audio_input(record_label)
 
 # Fallback: File Uploader
 uploaded_file = st.file_uploader(
@@ -227,7 +273,11 @@ if input_file is not None:
             
             # Align
             aligner = MelodyAligner(match_score=alignment_strictness)
-            results = aligner.align(selected_melody["notes"], detected_notes)
+            results = aligner.align(
+                selected_drill["notes"],
+                detected_notes,
+                drill_type=selected_drill["type"],
+            )
             
             # Display score & results
             score_col, detail_col = st.columns([1, 2])
@@ -241,6 +291,11 @@ if input_file is not None:
             with detail_col:
                 st.markdown("### Performance Overview")
                 st.write(f"🏁 **Pitch Tracking Status:** Success")
+                st.write(f"🎯 **Pitch Score:** {int(results['pitch_score'] * 100)}%")
+                if results.get("interval_score") is not None:
+                    st.write(f"🎼 **Interval Score:** {int(results['interval_score'] * 100)}%")
+                if results.get("timing_score") is not None:
+                    st.write(f"⏱️ **Rhythm Score:** {int(results['timing_score'] * 100)}%")
                 st.write(f"⏱️ **Rhythm & Timing:** {results['timing_feedback']}")
                 
                 st.markdown("#### Actionable Practice Tips:")
@@ -278,7 +333,7 @@ if input_file is not None:
             ax.yaxis.label.set_color('white')
             
             # Plot reference pitches as horizontal markers/lines
-            ref_notes = selected_melody["notes"]
+            ref_notes = selected_drill["notes"]
             ref_hz_values = [NOTE_FREQS.get(n, 261.63) for n in ref_notes]
             for note_name, hz in zip(ref_notes, ref_hz_values):
                 ax.axhline(hz, color='gray', linestyle='--', alpha=0.5)

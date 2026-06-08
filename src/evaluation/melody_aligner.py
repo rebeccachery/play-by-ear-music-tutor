@@ -1,5 +1,23 @@
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional
 import numpy as np
+
+NOTE_TO_MIDI = {
+    "C": 0, "C#": 1, "Db": 1, "D": 2, "D#": 3, "Eb": 3, "E": 4, "F": 5,
+    "F#": 6, "Gb": 6, "G": 7, "G#": 8, "Ab": 8, "A": 9, "A#": 10, "Bb": 10, "B": 11,
+}
+
+
+def note_to_midi(note: str) -> int:
+    """Convert note name like 'C4' or 'Db4' to MIDI number."""
+    pitch = note[:-1]
+    octave = int(note[-1])
+    return NOTE_TO_MIDI[pitch] + (octave + 1) * 12
+
+
+def parse_note(note: str) -> tuple:
+    """Return (pitch_class, octave) from a note name."""
+    return note[:-1], int(note[-1])
+
 
 class MelodyAligner:
     """
@@ -11,10 +29,17 @@ class MelodyAligner:
         self.mismatch_score = mismatch_score
         self.gap_penalty = gap_penalty
 
-    def align(self, target_notes: List[str], played_notes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def align(
+        self,
+        target_notes: List[str],
+        played_notes: List[Dict[str, Any]],
+        drill_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Align target_notes (e.g., ['C4', 'E4', 'G4']) with played_notes dictionaries.
         Returns alignment score, detailed alignment path, and feedback.
+
+        drill_type adjusts scoring weights: single_note, interval, motif, melody.
         """
         N = len(target_notes)
         M = len(played_notes)
@@ -95,36 +120,158 @@ class MelodyAligner:
                 
         alignment.reverse()
         
-        # Calculate pitch accuracy
+        scoring = self._score_alignment(alignment, target_notes, played_notes, drill_type)
+
+        tips = self._generate_tips(alignment, drill_type, scoring)
+
+        return {
+            "alignment": alignment,
+            "accuracy": scoring["accuracy"],
+            "pitch_score": scoring["pitch_score"],
+            "interval_score": scoring.get("interval_score"),
+            "timing_score": scoring.get("timing_score"),
+            "timing_feedback": scoring["timing_feedback"],
+            "tips": tips,
+            "drill_type": drill_type or "melody",
+        }
+
+    def _score_alignment(
+        self,
+        alignment: List[Dict[str, Any]],
+        target_notes: List[str],
+        played_notes: List[Dict[str, Any]],
+        drill_type: Optional[str],
+    ) -> Dict[str, Any]:
+        N = len(target_notes)
         correct_count = sum(1 for step in alignment if step["type"] == "match")
-        accuracy = (correct_count / N) if N > 0 else 0.0
-        
-        # Timing feedback
-        timing_feedback = self._evaluate_timing(alignment)
-        
-        # Generate actionable advice
+        pitch_score = (correct_count / N) if N > 0 else 0.0
+
+        partial_count = sum(
+            1 for step in alignment
+            if step["type"] == "substitution"
+            and step.get("played_note")
+            and parse_note(step["target_note"])[0] == parse_note(step["played_note"])[0]
+        )
+        if drill_type == "single_note" and N == 1:
+            pitch_score = self._score_single_note(alignment, target_notes[0], played_notes)
+            timing_feedback = "Rhythm is not scored for single-note drills."
+            return {
+                "accuracy": pitch_score,
+                "pitch_score": pitch_score,
+                "timing_feedback": timing_feedback,
+            }
+
+        interval_score = None
+        if drill_type == "interval" and N >= 2:
+            interval_score = self._score_interval(target_notes, played_notes)
+            pitch_score = 0.7 * pitch_score + 0.3 * (partial_count / N if N else 0)
+            accuracy = 0.6 * pitch_score + 0.4 * interval_score
+            timing_feedback = "Focus on pitch for now — rhythm is secondary for intervals."
+        elif drill_type in ("single_note", "interval"):
+            accuracy = pitch_score
+            timing_feedback = (
+                "Rhythm is not scored for this drill type."
+                if drill_type == "interval"
+                else "Rhythm is not scored for single-note drills."
+            )
+        elif drill_type == "motif":
+            accuracy = 0.85 * pitch_score + 0.15 * self._rhythm_consistency_score(alignment)
+            timing_feedback = self._evaluate_timing(alignment, include_rhythm_score=False)
+        else:
+            rhythm_score = self._rhythm_consistency_score(alignment)
+            accuracy = 0.7 * pitch_score + 0.3 * rhythm_score
+            timing_feedback = self._evaluate_timing(alignment, include_rhythm_score=False)
+
+        result: Dict[str, Any] = {
+            "accuracy": accuracy,
+            "pitch_score": pitch_score,
+            "timing_feedback": timing_feedback,
+        }
+        if interval_score is not None:
+            result["interval_score"] = interval_score
+        if drill_type in ("motif", "melody", None):
+            result["timing_score"] = self._rhythm_consistency_score(alignment)
+        return result
+
+    def _score_single_note(
+        self,
+        alignment: List[Dict[str, Any]],
+        target_note: str,
+        played_notes: List[Dict[str, Any]],
+    ) -> float:
+        for step in alignment:
+            if step["type"] == "match" and step["target_note"] == target_note:
+                return 1.0
+            if step["type"] == "substitution" and step.get("played_note"):
+                if parse_note(step["target_note"])[0] == parse_note(step["played_note"])[0]:
+                    return 0.5
+        if played_notes:
+            played = played_notes[0]["note"]
+            if played == target_note:
+                return 1.0
+            if parse_note(played)[0] == parse_note(target_note)[0]:
+                return 0.5
+        return 0.0
+
+    def _score_interval(
+        self,
+        target_notes: List[str],
+        played_notes: List[Dict[str, Any]],
+    ) -> float:
+        if len(target_notes) < 2 or len(played_notes) < 2:
+            return 0.0
+        target_semitones = note_to_midi(target_notes[1]) - note_to_midi(target_notes[0])
+        played_semitones = note_to_midi(played_notes[1]["note"]) - note_to_midi(played_notes[0]["note"])
+        return 1.0 if target_semitones == played_semitones else 0.0
+
+    def _rhythm_consistency_score(self, alignment: List[Dict[str, Any]]) -> float:
+        played_durations = []
+        for step in alignment:
+            if step["type"] == "match" and step["played_info"] is not None:
+                info = step["played_info"]
+                played_durations.append(info["end_time"] - info["start_time"])
+        if len(played_durations) < 2:
+            return 0.5
+        mean_duration = np.mean(played_durations)
+        std_duration = np.std(played_durations)
+        coef_var = std_duration / mean_duration if mean_duration > 0 else 1.0
+        return float(max(0.0, 1.0 - coef_var))
+
+    def _generate_tips(
+        self,
+        alignment: List[Dict[str, Any]],
+        drill_type: Optional[str],
+        scoring: Dict[str, Any],
+    ) -> List[str]:
         tips = []
         for step in alignment:
             if step["type"] == "substitution":
-                tips.append(f"Work on the transition/interval to {step['target_note']} (you played {step['played_note']} instead).")
+                target = step["target_note"]
+                played = step["played_note"]
+                if drill_type == "single_note":
+                    tips.append(f"You played {played} — the target was {target}.")
+                else:
+                    tips.append(
+                        f"Work on the transition to {target} (you played {played} instead)."
+                    )
             elif step["type"] == "deletion":
                 tips.append(f"Make sure to play {step['target_note']}; it was missed.")
-                
+            elif step["type"] == "insertion":
+                tips.append(f"Extra note {step['played_note']} — try to play only what you hear.")
+
+        if drill_type == "interval" and scoring.get("interval_score") == 0.0:
+            tips.append("The interval size was off — listen for the distance between the two notes.")
+
         if not tips:
-            tips.append("Excellent work! You played all notes correctly and in the right order.")
-            
-        return {
-            "alignment": alignment,
-            "accuracy": accuracy,
-            "timing_feedback": timing_feedback,
-            "tips": list(set(tips))[:3] # Max 3 distinct tips
-        }
-        
-    def _evaluate_timing(self, alignment: List[Dict[str, Any]]) -> str:
-        """
-        Evaluate user rhythm and speed based on matched notes.
-        """
-        matched_durations = []
+            tips.append("Excellent work! You played the drill correctly.")
+        return list(dict.fromkeys(tips))[:3]
+
+    def _evaluate_timing(
+        self,
+        alignment: List[Dict[str, Any]],
+        include_rhythm_score: bool = True,
+    ) -> str:
+        """Evaluate user rhythm and speed based on matched notes."""
         played_durations = []
         
         for step in alignment:
