@@ -1,23 +1,20 @@
-import streamlit as st
-import numpy as np
-import io
+import logging
 import os
-import soundfile as sf
+import tempfile
+
+import streamlit as st
 import matplotlib.pyplot as plt
-from scipy.io import wavfile
-import librosa
 
 # Import local modules
 from src.database.drills import (
     DRILL_LEVELS,
     get_drills_by_level,
-    duration_to_seconds,
 )
 from src.audio_processing.librosa_pyin import LibrosaPyinTracker
+from src.audio_processing.synth import generate_reference_audio, note_to_hz
 from src.evaluation.melody_aligner import MelodyAligner
 
-# Ensure temp directory exists for file handling
-os.makedirs("temp", exist_ok=True)
+logger = logging.getLogger(__name__)
 
 # -----------------
 # Premium Design CSS
@@ -107,15 +104,6 @@ st.markdown("""
 # -----------------
 # Musical Helpers
 # -----------------
-NOTE_FREQS = {
-    'C4': 261.63, 'C#4': 277.18, 'Db4': 277.18, 'D4': 293.66, 'D#4': 311.13, 'Eb4': 311.13,
-    'E4': 329.63, 'F4': 349.23, 'F#4': 369.99, 'Gb4': 369.99, 'G4': 392.00, 'G#4': 415.30,
-    'Ab4': 415.30, 'A4': 440.00, 'A#4': 466.16, 'Bb4': 466.16, 'B4': 493.88,
-    'C5': 523.25, 'C#5': 554.37, 'Db5': 554.37, 'D5': 587.33, 'D#5': 622.25, 'Eb5': 622.25,
-    'E5': 659.25, 'F5': 698.46, 'F#5': 739.99, 'Gb5': 739.99, 'G5': 783.99, 'G#5': 830.61,
-    'Ab5': 830.61, 'A5': 880.00, 'A#5': 932.33, 'Bb5': 932.33, 'B5': 987.77,
-}
-
 FINGERING_DATABASE = {
     'C4': {'guitar': 'String 5, Fret 3', 'piano': 'Middle C (first white key left of 2 black keys)'},
     'D4': {'guitar': 'String 4, Open', 'piano': 'White key between the 2 black keys'},
@@ -130,26 +118,9 @@ FINGERING_DATABASE = {
 def get_fingering(note: str) -> dict:
     return FINGERING_DATABASE.get(note, {'guitar': 'Check chord diagram', 'piano': 'Varies'})
 
-def generate_reference_audio(drill: dict, sample_rate=22050) -> bytes:
-    """Synthesize reference drill into a clean sine wave audio track."""
-    tempo_bpm = drill.get("tempo_bpm", 60)
-    audio_data = []
-
-    for note, dur in zip(drill["notes"], drill["durations"]):
-        freq = NOTE_FREQS.get(note, 261.63)
-        note_seconds = duration_to_seconds(dur, tempo_bpm)
-        t = np.linspace(0, note_seconds, int(sample_rate * note_seconds), endpoint=False)
-        fade = np.linspace(1.0, 0.01, len(t))
-        wave = np.sin(2 * np.pi * freq * t) * fade
-        audio_data.extend(wave)
-
-        silence = np.zeros(int(sample_rate * 0.05))
-        audio_data.extend(silence)
-
-    audio_array = np.array(audio_data, dtype=np.float32)
-    buffer = io.BytesIO()
-    sf.write(buffer, audio_array, sample_rate, format='wav')
-    return buffer.getvalue()
+@st.cache_data(show_spinner=False)
+def cached_reference_audio(drill_id: str, _drill: dict) -> bytes:
+    return generate_reference_audio(_drill)
 
 
 DRILL_TYPE_LABELS = {
@@ -223,7 +194,7 @@ with col1:
         st.write(f"**Interval:** {selected_drill['interval_name']}")
     st.write(f"**Target Notes:** `{' ➔ '.join(selected_drill['notes'])}`")
 with col2:
-    ref_audio_bytes = generate_reference_audio(selected_drill)
+    ref_audio_bytes = cached_reference_audio(selected_drill["id"], selected_drill)
     st.write("🔈 Reference Guide:")
     st.audio(ref_audio_bytes, format="audio/wav")
 st.markdown("</div>", unsafe_allow_html=True)
@@ -261,11 +232,14 @@ if input_file is not None:
     st.subheader("Step 3: AI Musical Feedback")
     
     with st.spinner("Processing audio & tracking pitch..."):
-        # Save temp file
-        temp_path = os.path.join("temp", "input_audio.wav")
-        with open(temp_path, "wb") as f:
-            f.write(input_file.read())
-            
+        # Each request gets its own temp file so concurrent users can't
+        # overwrite each other's recordings.
+        suffix = os.path.splitext(getattr(input_file, "name", "") or "")[1] or ".wav"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(input_file.getvalue())
+            temp_path = tmp.name
+
+        fig = None
         try:
             # Transcribe
             tracker = LibrosaPyinTracker()
@@ -277,6 +251,8 @@ if input_file is not None:
                 selected_drill["notes"],
                 detected_notes,
                 drill_type=selected_drill["type"],
+                target_durations=selected_drill["durations"],
+                tempo_bpm=selected_drill.get("tempo_bpm"),
             )
             
             # Display score & results
@@ -322,10 +298,6 @@ if input_file is not None:
             st.markdown("---")
             st.markdown("### Pitch Tracking Graph")
             
-            # Load audio for plotting
-            y, sr = librosa.load(temp_path, sr=22050)
-            times = librosa.times_like(y, sr=sr)
-            
             fig, ax = plt.subplots(figsize=(10, 3.5), facecolor='none')
             ax.set_facecolor('#1E1E1E')
             ax.tick_params(colors='white')
@@ -334,7 +306,7 @@ if input_file is not None:
             
             # Plot reference pitches as horizontal markers/lines
             ref_notes = selected_drill["notes"]
-            ref_hz_values = [NOTE_FREQS.get(n, 261.63) for n in ref_notes]
+            ref_hz_values = [note_to_hz(n) for n in ref_notes]
             for note_name, hz in zip(ref_notes, ref_hz_values):
                 ax.axhline(hz, color='gray', linestyle='--', alpha=0.5)
                 ax.text(0.1, hz + 5, note_name, color='gray', fontsize=8)
@@ -369,7 +341,15 @@ if input_file is not None:
                     - *Piano:* `{f_info['piano']}`
                     """)
                     
-        except Exception as e:
-            st.error(f"Error processing audio. Please make sure the audio file is clear and formatted correctly. Details: {e}")
+        except Exception:
+            logger.exception("Failed to analyse audio for drill %s", selected_drill["id"])
+            st.error("Sorry, we couldn't analyse that recording. Please make sure the audio is clear and in WAV, MP3 or M4A format, then try again.")
+        finally:
+            if fig is not None:
+                plt.close(fig)
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
             
     st.markdown("</div>", unsafe_allow_html=True)
